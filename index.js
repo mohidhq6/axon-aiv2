@@ -1,160 +1,111 @@
-// index.js
-import pkg from "@slack/bolt";
-const { App } = pkg;
-
-import OpenAI from "openai";
-import axios from "axios";
+import express from "express";
+import bodyParser from "body-parser";
+import fetch from "node-fetch";
 import fs from "fs";
+import path from "path";
+import { App } from "@slack/bolt";
+import pdf from "pdf-parse";
+import OpenAI from "openai";
 import dotenv from "dotenv";
-import Tesseract from "tesseract.js";
-import { PDFDocument, StandardFonts } from "pdf-lib";
-import * as pdfjsLib from "pdfjs-dist";
 
 dotenv.config();
 
-const PORT = process.env.PORT || 10000;
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const app = express();
+app.use(bodyParser.json());
 
-const app = new App({
+const slackApp = new App({
   token: process.env.SLACK_BOT_TOKEN,
   signingSecret: process.env.SLACK_SIGNING_SECRET,
 });
 
-// -----------------------------
-// 🔹 Helper: Extract text from PDFs
-// -----------------------------
-async function extractTextFromPDF(buffer) {
-  const loadingTask = pdfjsLib.getDocument({ data: buffer });
-  const pdf = await loadingTask.promise;
-  let text = "";
-
-  for (let i = 1; i <= pdf.numPages; i++) {
-    const page = await pdf.getPage(i);
-    const content = await page.getTextContent();
-    const pageText = content.items.map((it) => it.str).join(" ");
-    text += `\n\n--- Page ${i} ---\n${pageText}`;
-  }
-
-  return text.trim();
+// helper: get text from pdf
+async function extractTextFromPDF(filePath) {
+  const dataBuffer = fs.readFileSync(filePath);
+  const parsed = await pdf(dataBuffer);
+  return parsed.text || "";
 }
 
-// -----------------------------
-// 🔹 Helper: OCR text from images
-// -----------------------------
-async function extractTextFromImage(buffer) {
-  const result = await Tesseract.recognize(buffer, "eng");
-  return result.data.text.trim();
-}
-
-// -----------------------------
-// 🔹 Helper: Ask OpenAI
-// -----------------------------
-async function askOpenAI(prompt, detailed = false) {
-  const model = detailed ? "gpt-4o" : "gpt-4o-mini";
-  const system = detailed
-    ? "You are Axon AI, an expert IGCSE tutor. Solve the questions carefully, show working where relevant, and format answers clearly."
-    : "You are Axon AI, a friendly IGCSE tutor. Explain concepts simply and clearly.";
-
-  const response = await openai.chat.completions.create({
-    model,
-    messages: [
-      { role: "system", content: system },
-      { role: "user", content: prompt },
-    ],
-  });
-
-  return response.choices[0].message.content;
-}
-
-// -----------------------------
-// 🔹 Helper: Create a solved PDF
-// -----------------------------
-async function createSolvedPDF(original, solution) {
-  const pdfDoc = await PDFDocument.create();
-  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
-  const page = pdfDoc.addPage([595, 842]);
-  const fontSize = 11;
-
-  const text = `Original Worksheet:\n\n${original.slice(0, 5000)}\n\n---\n\nSolution:\n\n${solution}`;
-  const lines = text.match(/.{1,110}/g) || [];
-
-  let y = 800;
-  for (const line of lines) {
-    page.drawText(line, { x: 40, y, size: fontSize, font });
-    y -= 14;
-    if (y < 40) {
-      y = 800;
-      pdfDoc.addPage();
-    }
-  }
-
-  const bytes = await pdfDoc.save();
-  const path = `/tmp/axon_solution_${Date.now()}.pdf`;
-  fs.writeFileSync(path, bytes);
-  return path;
-}
-
-// -----------------------------
-// 🔹 Event Handler: @mention
-// -----------------------------
-app.event("app_mention", async ({ event, client, logger }) => {
+// handle app mentions (chat or files)
+slackApp.event("app_mention", async ({ event, client }) => {
   try {
-    const messageText = (event.text || "").replace(/<@[^>]+>/g, "").trim();
+    const userMessage = event.text.replace(/<@[^>]+>/, "").trim();
 
-    // 🧾 Handle attached files (PDF or image)
+    // 1️⃣ Check if a file is attached
     if (event.files && event.files.length > 0) {
       const file = event.files[0];
+      const fileUrl = file.url_private_download;
+      const tempPath = path.join("/tmp", file.name);
+
+      // acknowledge
       await client.chat.postMessage({
         channel: event.channel,
         thread_ts: event.ts,
-        text: "📘 Processing your worksheet — please wait a moment.",
+        text: "📄 Processing your worksheet — please wait a moment.",
       });
 
-      const url = file.url_private_download || file.url_private;
-      const res = await axios.get(url, {
-        responseType: "arraybuffer",
+      // download file
+      const response = await fetch(fileUrl, {
         headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
       });
-      const buffer = Buffer.from(res.data);
 
-      let extracted = "";
-      if (file.mimetype.includes("pdf")) extracted = await extractTextFromPDF(buffer);
-      else if (file.mimetype.startsWith("image/")) extracted = await extractTextFromImage(buffer);
-      else extracted = "Unsupported file type.";
+      const buffer = await response.arrayBuffer();
+      fs.writeFileSync(tempPath, Buffer.from(buffer));
 
-      const solution = await askOpenAI(extracted, true);
-      const solvedPath = await createSolvedPDF(extracted, solution);
+      // extract text
+      const text = await extractTextFromPDF(tempPath);
 
-      await client.files.upload({
-        channels: event.channel,
-        thread_ts: event.ts,
-        file: fs.createReadStream(solvedPath),
-        filename: "axon_solution.pdf",
-        initial_comment: "✅ Here’s your solved worksheet!",
+      if (!text || text.trim().length < 5) {
+        throw new Error("Could not extract text from PDF");
+      }
+
+      // send to OpenAI for solving
+      const gptRes = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are a helpful academic assistant. Read worksheet text and provide clear step-by-step answers directly in text format.",
+          },
+          { role: "user", content: text },
+        ],
       });
 
-      fs.unlinkSync(solvedPath);
-      return;
-    }
+      const answer = gptRes.choices[0].message.content;
 
-    // 💬 Handle regular chat questions
-    if (messageText.length > 0) {
-      const answer = await askOpenAI(messageText, false);
       await client.chat.postMessage({
         channel: event.channel,
         thread_ts: event.ts,
-        text: answer,
+        text: `✅ Here's the solved worksheet:\n\n${answer}`,
       });
+
+      fs.unlinkSync(tempPath);
     } else {
+      // 2️⃣ Normal question (no file)
+      const gptRes = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are a helpful academic assistant that answers questions directly in Slack threads. Be concise but clear.",
+          },
+          { role: "user", content: userMessage },
+        ],
+      });
+
+      const reply = gptRes.choices[0].message.content;
+
       await client.chat.postMessage({
         channel: event.channel,
         thread_ts: event.ts,
-        text: "Hi! Mention me with a question or upload a worksheet for me to solve.",
+        text: reply,
       });
     }
   } catch (err) {
-    logger.error(err);
-    await client.chat.postMessage({
+    console.error("Error:", err);
+    await slackApp.client.chat.postMessage({
       channel: event.channel,
       thread_ts: event.ts,
       text: "⚠️ Sorry, something went wrong while processing your request.",
@@ -162,10 +113,7 @@ app.event("app_mention", async ({ event, client, logger }) => {
   }
 });
 
-// -----------------------------
-// 🔹 Start the App
-// -----------------------------
 (async () => {
-  await app.start(PORT);
-  console.log(`✅ Axon AI running on port ${PORT}`);
+  await slackApp.start(process.env.PORT || 10000);
+  console.log(`🚀 Axon AI is running on port ${process.env.PORT || 10000}`);
 })();
