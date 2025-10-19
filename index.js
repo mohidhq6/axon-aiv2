@@ -8,7 +8,8 @@ import dotenv from "dotenv";
 import OpenAI from "openai";
 import pkg from "@slack/bolt";
 import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
-import tesseract from "tesseract.js-node";
+import Tesseract from "tesseract.js";
+
 
 dotenv.config();
 const { App, ExpressReceiver } = pkg;
@@ -68,7 +69,7 @@ async function extractTextFromPDFBuffer(buffer) {
 
 async function extractTextFromImageBuffer(buffer) {
   try {
-    const { data: { text } } = await tesseract.recognize(buffer, "eng");
+    const { data: { text } } = await Tesseract.recognize(buffer, "eng");
     return text.trim();
   } catch (err) {
     console.error("OCR Error:", err);
