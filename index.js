@@ -1,166 +1,128 @@
-import express from "express";
-import bodyParser from "body-parser";
-import dotenv from "dotenv";
-import { WebClient } from "@slack/web-api";
+import { App } from "@slack/bolt";
 import OpenAI from "openai";
-import fs from "fs";
 import axios from "axios";
-import pdfParse from "pdf-parse";
-import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 import Tesseract from "tesseract.js";
 
-dotenv.config();
-
-const app = express();
-const port = process.env.PORT || 10000;
-
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: false }));
-
-const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-// ---------- Helper: Create Solved PDF ----------
-async function generateSolvedPDF(question, answer) {
-  const pdfDoc = await PDFDocument.create();
-  const page = pdfDoc.addPage([595, 842]);
-  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
-  const fontSize = 12;
-
-  const text = `Worksheet Question(s):\n\n${question}\n\n---\n\nAxon AI Solution:\n\n${answer}`;
-  page.drawText(text, {
-    x: 50,
-    y: 750,
-    size: fontSize,
-    font,
-    color: rgb(0, 0, 0),
-    lineHeight: 16,
-    maxWidth: 500,
-  });
-
-  const pdfBytes = await pdfDoc.save();
-  const filePath = "./axon_solution.pdf";
-  fs.writeFileSync(filePath, pdfBytes);
-  return filePath;
-}
-
-// ---------- OCR Helper ----------
-async function extractTextFromImage(imageBuffer) {
-  try {
-    const { data } = await Tesseract.recognize(imageBuffer, "eng", {
-      logger: (m) => console.log(m.status),
-    });
-    return data.text.trim();
-  } catch (err) {
-    console.error("OCR error:", err);
-    return "";
+// Lazy import for pdf-parse (fixes Render startup error)
+let pdfParse;
+async function getPdfParse() {
+  if (!pdfParse) {
+    pdfParse = (await import("pdf-parse")).default;
   }
+  return pdfParse;
 }
 
-// ---------- Slack Event Handler ----------
-app.post("/slack/events", async (req, res) => {
+// ---- ENV SETUP ----
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+const app = new App({
+  token: process.env.SLACK_BOT_TOKEN,
+  signingSecret: process.env.SLACK_SIGNING_SECRET,
+  socketMode: false,
+  appToken: process.env.SLACK_APP_TOKEN,
+});
+
+// ---- TEXT MESSAGE HANDLER ----
+app.message(async ({ message, say }) => {
   try {
-    const { challenge, event } = req.body;
-    if (challenge) return res.status(200).send(challenge);
-    res.status(200).send(); // Immediate response to Slack
+    // Ignore bot messages
+    if (message.subtype === "bot_message") return;
 
-    if (!event || event.type !== "app_mention") return;
+    const userMessage = message.text || "";
 
-    const userPrompt = event.text.replace(/<@\w+>\s*/, "").trim();
-
-    // --------- If file is attached ---------
-    if (event.files && event.files.length > 0) {
-      const file = event.files[0];
-      const fileType = file.mimetype;
-
-      try {
-        const response = await axios.get(file.url_private_download, {
-          responseType: "arraybuffer",
-          headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
-        });
-
-        let extractedText = "";
-
-        if (fileType === "application/pdf") {
-          const pdfData = await pdfParse(response.data);
-          extractedText = pdfData.text.trim();
-        } else if (fileType.startsWith("image/")) {
-          extractedText = await extractTextFromImage(response.data);
-          if (!extractedText)
-            extractedText =
-              "I couldn’t read the image clearly. Please reupload a sharper version or type the question.";
-        } else {
-          await slackClient.chat.postMessage({
-            channel: event.channel,
-            text: "❌ Unsupported file type. Please upload a PDF or image.",
-            thread_ts: event.ts,
-          });
-          return;
-        }
-
-        // --------- Generate AI solution ---------
-        const aiResponse = await openai.chat.completions.create({
-          model: "gpt-4o",
-          messages: [
-            {
-              role: "system",
-              content:
-                "You are Axon AI, a smart educational tutor. Read the worksheet text and solve step-by-step with clarity.",
-            },
-            { role: "user", content: extractedText },
-          ],
-        });
-
-        const answer = aiResponse.choices[0].message.content || "No solution generated.";
-
-        // Create solved PDF
-        const solvedFilePath = await generateSolvedPDF(extractedText, answer);
-
-        // Upload to Slack
-        await slackClient.files.uploadV2({
-          channel_id: event.channel,
-          initial_comment: "✅ Here’s your solved worksheet, completed by Axon AI:",
-          file: fs.createReadStream(solvedFilePath),
-          filename: "axon_solution.pdf",
-          title: "Axon AI Solved Worksheet",
-        });
-
-        fs.unlinkSync(solvedFilePath);
-      } catch (err) {
-        console.error("File processing error:", err);
-        await slackClient.chat.postMessage({
-          channel: event.channel,
-          text:
-            "⚠️ Sorry, I couldn’t process that file. It may be too blurry or corrupted. Try again with a clearer upload.",
-          thread_ts: event.ts,
-        });
-      }
+    // Basic fallback
+    if (!userMessage.trim()) {
+      await say("Hi there! 👋 How can I help you study today?");
       return;
     }
 
-    // --------- Regular chat (no file) ---------
-    const aiChat = await openai.chat.completions.create({
+    // Chat response
+    const chatResponse = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
-        {
-          role: "system",
-          content:
-            "You are Axon AI, a friendly, expert tutor. Give short, clear explanations and examples.",
-        },
-        { role: "user", content: userPrompt },
+        { role: "system", content: "You are Axon AI, a patient and smart educational tutor." },
+        { role: "user", content: userMessage },
       ],
     });
 
-    const chatAnswer = aiChat.choices[0].message.content;
-
-    await slackClient.chat.postMessage({
-      channel: event.channel,
-      text: chatAnswer,
-      thread_ts: event.ts,
-    });
+    const reply = chatResponse.choices[0].message.content;
+    await say(reply);
   } catch (error) {
-    console.error("Slack event error:", error);
+    console.error("Message error:", error);
+    await say("❌ Sorry, something went wrong while processing that.");
   }
 });
 
-app.listen(port, () => console.log(`🚀 Axon AI running with OCR on port ${port}`));
+// ---- FILE HANDLER ----
+app.event("file_shared", async ({ event, client, say }) => {
+  try {
+    const fileId = event.file_id;
+    const fileInfo = await client.files.info({ file: fileId });
+    const file = fileInfo.file;
+
+    const url = file.url_private_download;
+    const fileType = file.mimetype;
+
+    const headers = { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` };
+    const response = await axios.get(url, { responseType: "arraybuffer", headers });
+
+    let extractedText = "";
+
+    // --- PDF handling ---
+    if (fileType === "application/pdf") {
+      const pdf = await getPdfParse();
+      const pdfData = await pdf(response.data);
+      extractedText = pdfData.text;
+    }
+
+    // --- Image handling (OCR + vision model) ---
+    else if (fileType.startsWith("image/")) {
+      const ocrResult = await Tesseract.recognize(response.data, "eng");
+      const ocrText = ocrResult.data.text.trim();
+
+      const visionResponse = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: "You are Axon AI, a helpful educational assistant." },
+          { role: "user", content: `Here's the question extracted from an image: ${ocrText}` },
+        ],
+      });
+
+      extractedText = visionResponse.choices[0].message.content;
+    }
+
+    // --- Unsupported file types ---
+    else {
+      await say("⚠️ Sorry, I can only process PDFs and images for now.");
+      return;
+    }
+
+    // --- Analyze extracted content ---
+    if (!extractedText.trim()) {
+      await say("❌ I couldn't extract any text from that file.");
+      return;
+    }
+
+    const solution = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: "You are a teacher that helps solve academic problems clearly." },
+        { role: "user", content: `Please analyze and solve this content:\n\n${extractedText}` },
+      ],
+    });
+
+    await say(solution.choices[0].message.content);
+  } catch (error) {
+    console.error("File processing error:", error);
+    await say("❌ Sorry, something went wrong while processing that.");
+  }
+});
+
+// ---- START SERVER ----
+(async () => {
+  const port = process.env.PORT || 3000;
+  await app.start(port);
+  console.log(`✅ Axon AI is running on port ${port}`);
+})();
