@@ -1,4 +1,6 @@
-import { App } from "@slack/bolt";
+import pkg from "@slack/bolt";
+const { App } = pkg;
+
 import OpenAI from "openai";
 import axios from "axios";
 import Tesseract from "tesseract.js";
