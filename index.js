@@ -1,18 +1,17 @@
-import express from "express";
-import bodyParser from "body-parser";
-import fetch from "node-fetch";
-import fs from "fs";
-import path from "path";
-import { App } from "@slack/bolt";
-import pdf from "pdf-parse";
-import OpenAI from "openai";
-import dotenv from "dotenv";
+// index.js — CommonJS version (Render-safe)
 
-dotenv.config();
+require("dotenv").config();
+const { App } = require("@slack/bolt");
+const express = require("express");
+const bodyParser = require("body-parser");
+const fetch = require("node-fetch");
+const fs = require("fs");
+const path = require("path");
+const pdf = require("pdf-parse");
+const OpenAI = require("openai");
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const app = express();
-app.use(bodyParser.json());
+const PORT = process.env.PORT || 10000;
 
 const slackApp = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -26,47 +25,42 @@ async function extractTextFromPDF(filePath) {
   return parsed.text || "";
 }
 
-// handle app mentions (chat or files)
+// event: app mention
 slackApp.event("app_mention", async ({ event, client }) => {
   try {
     const userMessage = event.text.replace(/<@[^>]+>/, "").trim();
 
-    // 1️⃣ Check if a file is attached
+    // If file attached
     if (event.files && event.files.length > 0) {
       const file = event.files[0];
       const fileUrl = file.url_private_download;
       const tempPath = path.join("/tmp", file.name);
 
-      // acknowledge
       await client.chat.postMessage({
         channel: event.channel,
         thread_ts: event.ts,
         text: "📄 Processing your worksheet — please wait a moment.",
       });
 
-      // download file
+      // Download file
       const response = await fetch(fileUrl, {
         headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
       });
-
       const buffer = await response.arrayBuffer();
       fs.writeFileSync(tempPath, Buffer.from(buffer));
 
-      // extract text
+      // Extract text
       const text = await extractTextFromPDF(tempPath);
+      if (!text || text.trim().length < 5) throw new Error("Empty PDF text");
 
-      if (!text || text.trim().length < 5) {
-        throw new Error("Could not extract text from PDF");
-      }
-
-      // send to OpenAI for solving
+      // Solve using GPT
       const gptRes = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [
           {
             role: "system",
             content:
-              "You are a helpful academic assistant. Read worksheet text and provide clear step-by-step answers directly in text format.",
+              "You are a helpful academic assistant. Read the worksheet and give full, clear, step-by-step answers in text only.",
           },
           { role: "user", content: text },
         ],
@@ -82,21 +76,20 @@ slackApp.event("app_mention", async ({ event, client }) => {
 
       fs.unlinkSync(tempPath);
     } else {
-      // 2️⃣ Normal question (no file)
+      // Normal question
       const gptRes = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [
           {
             role: "system",
             content:
-              "You are a helpful academic assistant that answers questions directly in Slack threads. Be concise but clear.",
+              "You are a knowledgeable academic tutor. Answer user questions directly and clearly in text form.",
           },
           { role: "user", content: userMessage },
         ],
       });
 
       const reply = gptRes.choices[0].message.content;
-
       await client.chat.postMessage({
         channel: event.channel,
         thread_ts: event.ts,
@@ -113,7 +106,8 @@ slackApp.event("app_mention", async ({ event, client }) => {
   }
 });
 
+// start server
 (async () => {
-  await slackApp.start(process.env.PORT || 10000);
-  console.log(`🚀 Axon AI is running on port ${process.env.PORT || 10000}`);
+  await slackApp.start(PORT);
+  console.log(`🚀 Axon AI is running on port ${PORT}`);
 })();
