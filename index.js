@@ -7,6 +7,7 @@ import fs from "fs";
 import axios from "axios";
 import pdfParse from "pdf-parse";
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+import Tesseract from "tesseract.js";
 
 dotenv.config();
 
@@ -43,28 +44,36 @@ async function generateSolvedPDF(question, answer) {
   return filePath;
 }
 
+// ---------- OCR Helper ----------
+async function extractTextFromImage(imageBuffer) {
+  try {
+    const { data } = await Tesseract.recognize(imageBuffer, "eng", {
+      logger: (m) => console.log(m.status),
+    });
+    return data.text.trim();
+  } catch (err) {
+    console.error("OCR error:", err);
+    return "";
+  }
+}
+
 // ---------- Slack Event Handler ----------
 app.post("/slack/events", async (req, res) => {
   try {
     const { challenge, event } = req.body;
-
-    // Slack verification handshake
     if (challenge) return res.status(200).send(challenge);
-
-    // Respond quickly to avoid Slack timeouts
-    res.status(200).send();
+    res.status(200).send(); // Immediate response to Slack
 
     if (!event || event.type !== "app_mention") return;
 
     const userPrompt = event.text.replace(/<@\w+>\s*/, "").trim();
 
-    // Check if a file is attached
+    // --------- If file is attached ---------
     if (event.files && event.files.length > 0) {
       const file = event.files[0];
       const fileType = file.mimetype;
 
       try {
-        // Download file from Slack
         const response = await axios.get(file.url_private_download, {
           responseType: "arraybuffer",
           headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
@@ -76,35 +85,38 @@ app.post("/slack/events", async (req, res) => {
           const pdfData = await pdfParse(response.data);
           extractedText = pdfData.text.trim();
         } else if (fileType.startsWith("image/")) {
-          extractedText = "This is an image. Please describe the question visually.";
+          extractedText = await extractTextFromImage(response.data);
+          if (!extractedText)
+            extractedText =
+              "I couldn’t read the image clearly. Please reupload a sharper version or type the question.";
         } else {
           await slackClient.chat.postMessage({
             channel: event.channel,
-            text: "❌ Unsupported file type. Please upload a PDF or an image.",
+            text: "❌ Unsupported file type. Please upload a PDF or image.",
             thread_ts: event.ts,
           });
           return;
         }
 
-        // Solve using OpenAI
+        // --------- Generate AI solution ---------
         const aiResponse = await openai.chat.completions.create({
           model: "gpt-4o",
           messages: [
             {
               role: "system",
               content:
-                "You are Axon AI, an expert educational tutor. Solve worksheets clearly and neatly. Include step-by-step reasoning.",
+                "You are Axon AI, a smart educational tutor. Read the worksheet text and solve step-by-step with clarity.",
             },
             { role: "user", content: extractedText },
           ],
         });
 
-        const answer = aiResponse.choices[0].message.content || "No answer generated.";
+        const answer = aiResponse.choices[0].message.content || "No solution generated.";
 
-        // Generate solved PDF
+        // Create solved PDF
         const solvedFilePath = await generateSolvedPDF(extractedText, answer);
 
-        // Upload solved PDF using files.uploadV2
+        // Upload to Slack
         await slackClient.files.uploadV2({
           channel_id: event.channel,
           initial_comment: "✅ Here’s your solved worksheet, completed by Axon AI:",
@@ -115,26 +127,25 @@ app.post("/slack/events", async (req, res) => {
 
         fs.unlinkSync(solvedFilePath);
       } catch (err) {
-        console.error("File handling error:", err);
+        console.error("File processing error:", err);
         await slackClient.chat.postMessage({
           channel: event.channel,
           text:
-            "⚠️ Sorry — I couldn’t process that file. It may be scanned, password-protected, or corrupted.",
+            "⚠️ Sorry, I couldn’t process that file. It may be too blurry or corrupted. Try again with a clearer upload.",
           thread_ts: event.ts,
         });
       }
-
       return;
     }
 
-    // ---------- Regular Chat Questions ----------
+    // --------- Regular chat (no file) ---------
     const aiChat = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
         {
           role: "system",
           content:
-            "You are Axon AI, a friendly, expert tutor. Provide clear, concise educational explanations in chat.",
+            "You are Axon AI, a friendly, expert tutor. Give short, clear explanations and examples.",
         },
         { role: "user", content: userPrompt },
       ],
@@ -152,4 +163,4 @@ app.post("/slack/events", async (req, res) => {
   }
 });
 
-app.listen(port, () => console.log(`🚀 Axon AI running on port ${port}`));
+app.listen(port, () => console.log(`🚀 Axon AI running with OCR on port ${port}`));
