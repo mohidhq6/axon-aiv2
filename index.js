@@ -72,8 +72,15 @@ app.post("/slack/events", async (req, res) => {
         });
 
         // Extract text from the PDF
-        const pdfData = await pdfParse(response.data);
-        const textContent = pdfData.text.trim();
+        const pdfParser = new PDFParser();
+        const textContent = await new Promise((resolve, reject) => {
+          pdfParser.on("pdfParser_dataError", reject);
+          pdfParser.on("pdfParser_dataReady", () => {
+            const text = pdfParser.getRawTextContent();
+            resolve(text.trim());
+          });
+          pdfParser.parseBuffer(response.data);
+        });
 
         // Ask OpenAI to solve the worksheet
         const aiResponse = await openai.chat.completions.create({
