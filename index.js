@@ -5,46 +5,29 @@ import { WebClient } from "@slack/web-api";
 import OpenAI from "openai";
 import fs from "fs";
 import axios from "axios";
-import Tesseract from "tesseract.js";
+import pdfParse from "pdf-parse";
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
-import * as pdfjsLib from "pdfjs-dist";
 
 dotenv.config();
 
 const app = express();
 const port = process.env.PORT || 10000;
 
-app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: false }));
 
 const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-/** ✅ Extracts text from PDF safely (pdfjs-dist method) */
-async function extractTextFromPDF(buffer) {
-  const loadingTask = pdfjsLib.getDocument({ data: buffer });
-  const pdf = await loadingTask.promise;
-  let fullText = "";
-
-  for (let i = 1; i <= pdf.numPages; i++) {
-    const page = await pdf.getPage(i);
-    const textContent = await page.getTextContent();
-    const pageText = textContent.items.map((item) => item.str).join(" ");
-    fullText += pageText + "\n";
-  }
-
-  return fullText.trim();
-}
-
-/** Helper: generate solved PDF */
+// ---------- Helper: Create Solved PDF ----------
 async function generateSolvedPDF(question, answer) {
   const pdfDoc = await PDFDocument.create();
   const page = pdfDoc.addPage([595, 842]);
   const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
   const fontSize = 12;
 
-  const wrappedText = `Question:\n${question}\n\nAnswer:\n${answer}`;
-  page.drawText(wrappedText, {
+  const text = `Worksheet Question(s):\n\n${question}\n\n---\n\nAxon AI Solution:\n\n${answer}`;
+  page.drawText(text, {
     x: 50,
     y: 750,
     size: fontSize,
@@ -55,108 +38,118 @@ async function generateSolvedPDF(question, answer) {
   });
 
   const pdfBytes = await pdfDoc.save();
-  const filePath = `/tmp/axon_solution.pdf`; // ✅ safe on Render
+  const filePath = "./axon_solution.pdf";
   fs.writeFileSync(filePath, pdfBytes);
   return filePath;
 }
 
-/** Main Slack event handler */
+// ---------- Slack Event Handler ----------
 app.post("/slack/events", async (req, res) => {
   try {
     const { challenge, event } = req.body;
+
+    // Slack verification handshake
     if (challenge) return res.status(200).send(challenge);
+
+    // Respond quickly to avoid Slack timeouts
     res.status(200).send();
 
     if (!event || event.type !== "app_mention") return;
 
-    const prompt = event.text?.replace(/<@\w+>\s*/, "").trim() || "";
+    const userPrompt = event.text.replace(/<@\w+>\s*/, "").trim();
 
-    // --- Handle PDFs & Images ---
+    // Check if a file is attached
     if (event.files && event.files.length > 0) {
       const file = event.files[0];
-      const fileUrl = file.url_private_download;
       const fileType = file.mimetype;
-      let extractedText = "";
 
-      const fileResponse = await axios.get(fileUrl, {
-        responseType: "arraybuffer",
-        headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
-      });
+      try {
+        // Download file from Slack
+        const response = await axios.get(file.url_private_download, {
+          responseType: "arraybuffer",
+          headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+        });
 
-      if (fileType === "application/pdf") {
-        extractedText = await extractTextFromPDF(fileResponse.data);
-      } else if (fileType.startsWith("image/")) {
-        const result = await Tesseract.recognize(fileResponse.data, "eng");
-        extractedText = result.data.text.trim();
-      } else {
+        let extractedText = "";
+
+        if (fileType === "application/pdf") {
+          const pdfData = await pdfParse(response.data);
+          extractedText = pdfData.text.trim();
+        } else if (fileType.startsWith("image/")) {
+          extractedText = "This is an image. Please describe the question visually.";
+        } else {
+          await slackClient.chat.postMessage({
+            channel: event.channel,
+            text: "❌ Unsupported file type. Please upload a PDF or an image.",
+            thread_ts: event.ts,
+          });
+          return;
+        }
+
+        // Solve using OpenAI
+        const aiResponse = await openai.chat.completions.create({
+          model: "gpt-4o",
+          messages: [
+            {
+              role: "system",
+              content:
+                "You are Axon AI, an expert educational tutor. Solve worksheets clearly and neatly. Include step-by-step reasoning.",
+            },
+            { role: "user", content: extractedText },
+          ],
+        });
+
+        const answer = aiResponse.choices[0].message.content || "No answer generated.";
+
+        // Generate solved PDF
+        const solvedFilePath = await generateSolvedPDF(extractedText, answer);
+
+        // Upload solved PDF using files.uploadV2
+        await slackClient.files.uploadV2({
+          channel_id: event.channel,
+          initial_comment: "✅ Here’s your solved worksheet, completed by Axon AI:",
+          file: fs.createReadStream(solvedFilePath),
+          filename: "axon_solution.pdf",
+          title: "Axon AI Solved Worksheet",
+        });
+
+        fs.unlinkSync(solvedFilePath);
+      } catch (err) {
+        console.error("File handling error:", err);
         await slackClient.chat.postMessage({
           channel: event.channel,
-          text: "Sorry, I can only process PDFs and images for now.",
+          text:
+            "⚠️ Sorry — I couldn’t process that file. It may be scanned, password-protected, or corrupted.",
           thread_ts: event.ts,
         });
-        return;
       }
 
-      const aiResponse = await openai.chat.completions.create({
-        model: "gpt-4o",
-        messages: [
-          {
-            role: "system",
-            content:
-              "You are Axon AI, an expert IGCSE tutor. Read the worksheet and provide step-by-step solutions.",
-          },
-          { role: "user", content: extractedText },
-        ],
-      });
-
-      const answer = aiResponse.choices[0].message.content;
-      const solvedFilePath = await generateSolvedPDF(extractedText, answer);
-
-      await slackClient.files.uploadV2({
-        channel_id: event.channel,
-        initial_comment: "Here’s your solved worksheet 📘",
-        file_uploads: [
-          {
-            file: fs.createReadStream(solvedFilePath),
-            filename: "axon_solution.pdf",
-          },
-        ],
-      });
-
-      fs.unlinkSync(solvedFilePath);
       return;
     }
 
-    // --- Handle text-based chat questions ---
-    if (prompt.length > 0) {
-      const chatResponse = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "system",
-            content:
-              "You are Axon AI, a friendly and knowledgeable IGCSE tutor. Reply clearly and concisely.",
-          },
-          { role: "user", content: prompt },
-        ],
-      });
-
-      const answer = chatResponse.choices[0].message.content;
-
-      await slackClient.chat.postMessage({
-        channel: event.channel,
-        text: answer,
-        thread_ts: event.ts,
-      });
-    }
-  } catch (error) {
-    console.error("Error handling Slack event:", error);
-    await slackClient.chat.postMessage({
-      channel: req.body?.event?.channel,
-      text: "❌ Sorry, something went wrong while processing that.",
-      thread_ts: req.body?.event?.ts,
+    // ---------- Regular Chat Questions ----------
+    const aiChat = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are Axon AI, a friendly, expert tutor. Provide clear, concise educational explanations in chat.",
+        },
+        { role: "user", content: userPrompt },
+      ],
     });
+
+    const chatAnswer = aiChat.choices[0].message.content;
+
+    await slackClient.chat.postMessage({
+      channel: event.channel,
+      text: chatAnswer,
+      thread_ts: event.ts,
+    });
+  } catch (error) {
+    console.error("Slack event error:", error);
   }
 });
 
-app.listen(port, () => console.log(`✅ Axon AI running on port ${port}`));
+app.listen(port, () => console.log(`🚀 Axon AI running on port ${port}`));
