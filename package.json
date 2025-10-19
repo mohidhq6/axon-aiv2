@@ -1,16 +1,18 @@
+// package.json
 {
-  "name": "axon-slack-bot",
+  "name": "axon-ai-slackbot",
   "version": "1.0.0",
-  "type": "module",
+  "description": "Axon AI educational Slack bot (text, PDF, image question solving)",
   "main": "index.js",
-  "scripts": { "start": "node index.js" },
+  "scripts": {
+    "start": "node index.js"
+  },
   "dependencies": {
-    "@slack/web-api": "^7.0.0",
-    "body-parser": "^1.20.2",
-    "dotenv": "^16.3.1",
-    "express": "^4.18.2",
+    "@slack/bolt": "^3.12.2",
     "openai": "^4.0.0",
+    "pdf-parse": "^1.1.1",
     "pdf-lib": "^1.17.1",
-    "pdf2json": "^1.2.1"
+    "tesseract.js": "^4.1.1",
+    "axios": "^1.4.0"
   }
 }
