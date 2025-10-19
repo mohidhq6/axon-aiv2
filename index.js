@@ -1,4 +1,3 @@
-// index.js
 import express from "express";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
@@ -6,9 +5,9 @@ import { WebClient } from "@slack/web-api";
 import OpenAI from "openai";
 import fs from "fs";
 import axios from "axios";
-import pdfParse from "pdf-parse";
 import Tesseract from "tesseract.js";
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.js"; // ✅ replaces pdf-parse
 
 dotenv.config();
 
@@ -20,6 +19,22 @@ app.use(bodyParser.json());
 
 const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+/** ✅ Extracts text from PDF safely (pdfjs-dist method) */
+async function extractTextFromPDF(buffer) {
+  const loadingTask = pdfjsLib.getDocument({ data: buffer });
+  const pdf = await loadingTask.promise;
+  let fullText = "";
+
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const textContent = await page.getTextContent();
+    const pageText = textContent.items.map((item) => item.str).join(" ");
+    fullText += pageText + "\n";
+  }
+
+  return fullText.trim();
+}
 
 /** Helper: generate solved PDF */
 async function generateSolvedPDF(question, answer) {
@@ -40,7 +55,7 @@ async function generateSolvedPDF(question, answer) {
   });
 
   const pdfBytes = await pdfDoc.save();
-  const filePath = `/tmp/axon_solution.pdf`; // ✅ safe temp path
+  const filePath = `/tmp/axon_solution.pdf`; // ✅ safe on Render
   fs.writeFileSync(filePath, pdfBytes);
   return filePath;
 }
@@ -49,11 +64,7 @@ async function generateSolvedPDF(question, answer) {
 app.post("/slack/events", async (req, res) => {
   try {
     const { challenge, event } = req.body;
-
-    // ✅ Slack verification handshake
     if (challenge) return res.status(200).send(challenge);
-
-    // Always respond immediately
     res.status(200).send();
 
     if (!event || event.type !== "app_mention") return;
@@ -67,15 +78,13 @@ app.post("/slack/events", async (req, res) => {
       const fileType = file.mimetype;
       let extractedText = "";
 
-      // Download file
       const fileResponse = await axios.get(fileUrl, {
         responseType: "arraybuffer",
         headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
       });
 
       if (fileType === "application/pdf") {
-        const pdfData = await pdfParse(fileResponse.data);
-        extractedText = pdfData.text.trim();
+        extractedText = await extractTextFromPDF(fileResponse.data);
       } else if (fileType.startsWith("image/")) {
         const result = await Tesseract.recognize(fileResponse.data, "eng");
         extractedText = result.data.text.trim();
@@ -88,14 +97,13 @@ app.post("/slack/events", async (req, res) => {
         return;
       }
 
-      // Use OpenAI to solve
       const aiResponse = await openai.chat.completions.create({
         model: "gpt-4o",
         messages: [
           {
             role: "system",
             content:
-              "You are Axon AI, an expert IGCSE tutor. Read the worksheet and provide full, step-by-step solutions.",
+              "You are Axon AI, an expert IGCSE tutor. Read the worksheet and provide step-by-step solutions.",
           },
           { role: "user", content: extractedText },
         ],
@@ -104,7 +112,6 @@ app.post("/slack/events", async (req, res) => {
       const answer = aiResponse.choices[0].message.content;
       const solvedFilePath = await generateSolvedPDF(extractedText, answer);
 
-      // ✅ Slack now needs `channel_id` and `file_uploads` array
       await slackClient.files.uploadV2({
         channel_id: event.channel,
         initial_comment: "Here’s your solved worksheet 📘",
@@ -128,7 +135,7 @@ app.post("/slack/events", async (req, res) => {
           {
             role: "system",
             content:
-              "You are Axon AI, a friendly and knowledgeable IGCSE tutor. Reply in chat with clear, concise explanations.",
+              "You are Axon AI, a friendly and knowledgeable IGCSE tutor. Reply clearly and concisely.",
           },
           { role: "user", content: prompt },
         ],
