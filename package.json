@@ -8,15 +8,14 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "@slack/bolt": "^3.17.1",
-    "@slack/web-api": "^7.0.4",
-    "axios": "^1.6.8",
-    "body-parser": "^1.20.2",
-    "dotenv": "^16.4.1",
-    "express": "^4.19.2",
-    "fs": "0.0.1-security",
-    "openai": "^4.56.0",
-    "pdf-lib": "^1.17.1",
-    "pdf-parse": "^1.1.1"
+    "@slack/bolt": "3.17.1",
+    "@slack/web-api": "7.0.4",
+    "axios": "1.6.8",
+    "body-parser": "1.20.2",
+    "dotenv": "16.4.1",
+    "express": "4.19.2",
+    "openai": "4.56.0",
+    "pdf-lib": "1.17.1",
+    "pdf-parse": "1.1.1"
   }
 }
