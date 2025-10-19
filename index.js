@@ -5,7 +5,7 @@ import { WebClient } from "@slack/web-api";
 import OpenAI from "openai";
 import fs from "fs";
 import axios from "axios";
-import pdfParse from "pdf-parse";
+import PDFParser from "pdf2json";
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 
 dotenv.config();
