@@ -70,8 +70,8 @@ app.post("/slack/events", async (req, res) => {
       fs.writeFileSync(filePath, pdfBytes);
 
       // Upload the PDF to Slack
-      await slackClient.files.upload({
-        channels: event.channel,
+      await slackClient.files.uploadV2({
+        channel_id: event.channel,
         initial_comment: "Here’s your solved PDF 📘",
         file: fs.createReadStream(filePath),
         filename: "axon_solution.pdf",
