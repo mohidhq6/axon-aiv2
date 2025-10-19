@@ -1,3 +1,5 @@
+import pkg from "@slack/bolt";
+const { App } = pkg;
 import express from "express";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
