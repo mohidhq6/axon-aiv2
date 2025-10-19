@@ -5,7 +5,7 @@ import { WebClient } from "@slack/web-api";
 import OpenAI from "openai";
 import fs from "fs";
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
-import { buildGraderPrompt } from "./graderPrompt.js";
+import pdfParse from "pdf-parse";
 
 dotenv.config();
 
@@ -18,99 +18,121 @@ app.use(bodyParser.json());
 const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Respond to mentions (@Axon AI)
+// helper: create a PDF from text
+async function createPdfFromText(text, filename = "axon_solution.pdf") {
+  const pdfDoc = await PDFDocument.create();
+  const page = pdfDoc.addPage([595, 842]);
+  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const fontSize = 12;
+
+  const lines = text.split("\n");
+  let y = 800;
+  for (let line of lines) {
+    page.drawText(line, { x: 50, y, size: fontSize, font, color: rgb(0, 0, 0) });
+    y -= 16;
+    if (y < 50) {
+      page = pdfDoc.addPage([595, 842]);
+      y = 800;
+    }
+  }
+
+  const pdfBytes = await pdfDoc.save();
+  const path = `./${filename}`;
+  fs.writeFileSync(path, pdfBytes);
+  return path;
+}
+
 app.post("/slack/events", async (req, res) => {
   try {
     const { challenge, event } = req.body;
-
-    // Slack URL verification
     if (challenge) return res.status(200).send(challenge);
 
-    // Always respond immediately so Slack doesn't timeout
-    res.status(200).send();
+    res.status(200).send(); // immediate 200 for Slack
 
-    // Handle only app mentions (@Axon AI)
-    if (event && event.type === "app_mention") {
-      const prompt = event.text.replace(/<@\w+>\s*/, "").trim();
+    if (event.type !== "app_mention") return;
 
-      // Get answer from OpenAI
-      const response = await openai.chat.completions.create({
+    const textPrompt = (event.text || "").replace(/<@[\w]+>/, "").trim();
+
+    // 📘 CASE 1 — user attached a PDF
+    if (event.files && event.files.length > 0) {
+      const pdfFile = event.files.find(f => f.mimetype === "application/pdf");
+      if (!pdfFile) {
+        await slackClient.chat.postMessage({
+          channel: event.channel,
+          text: "Please attach a PDF file.",
+        });
+        return;
+      }
+
+      // download the PDF
+      const fileInfo = await slackClient.files.info({ file: pdfFile.id });
+      const url = fileInfo.file.url_private_download;
+
+      const response = await fetch(url, {
+        headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+      });
+      const buffer = Buffer.from(await response.arrayBuffer());
+
+      const data = await pdfParse(buffer);
+      const extractedText = data.text.trim();
+
+      if (!extractedText) {
+        await slackClient.chat.postMessage({
+          channel: event.channel,
+          text: "Couldn't read text from this PDF.",
+        });
+        return;
+      }
+
+      // send to OpenAI for solving
+      const aiResp = await openai.chat.completions.create({
         model: "gpt-4o",
         messages: [
-          {
-            role: "system",
-            content:
-              "You are Axon AI, a smart and friendly IGCSE tutor for Physics, Chemistry, Biology, Math, and English.",
-          },
-          { role: "user", content: prompt },
+          { role: "system", content: "You are Axon AI, a friendly IGCSE tutor." },
+          { role: "user", content: `Solve the questions in this text:\n${extractedText}` },
         ],
       });
 
-      const answer = response.choices[0].message.content;
+      const answer = aiResp.choices[0].message.content;
 
-      // Create a solved PDF with Q&A
-      const pdfDoc = await PDFDocument.create();
-      const page = pdfDoc.addPage([595, 842]); // A4
-      const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
-      const fontSize = 12;
+      // make PDF
+      const solvedPath = await createPdfFromText(answer, "axon_solution.pdf");
 
-      const text = `Question:\n${prompt}\n\nAnswer:\n${answer}`;
-      page.drawText(text, {
-        x: 50,
-        y: 750,
-        size: fontSize,
-        font,
-        color: rgb(0, 0, 0),
-        lineHeight: 16,
-        maxWidth: 500,
-      });
-
-      const pdfBytes = await pdfDoc.save();
-      const filePath = "./axon_solution.pdf";
-      fs.writeFileSync(filePath, pdfBytes);
-
-      // Upload the PDF to Slack
+      // upload solved PDF
       await slackClient.files.uploadV2({
         channel_id: event.channel,
         initial_comment: "Here’s your solved PDF 📘",
-        file: fs.createReadStream(filePath),
         filename: "axon_solution.pdf",
+        file: fs.createReadStream(solvedPath),
       });
 
-      // Cleanup
-      fs.unlinkSync(filePath);
+      fs.unlinkSync(solvedPath);
+
+      // short text reply too
+      await slackClient.chat.postMessage({
+        channel: event.channel,
+        text: "✅ Solved! See attached PDF.",
+      });
+      return;
     }
-  } catch (error) {
-    console.error("Error handling Slack event:", error);
-  }
-});
 
-// Slash commands: /explain, /quiz, /check
-app.post("/slack/commands", async (req, res) => {
-  const { command, text } = req.body;
-  let prompt = "";
-
-  if (command === "/explain") {
-    prompt = `Explain the following IGCSE concept clearly: ${text}`;
-  } else if (command === "/quiz") {
-    prompt = `Create a short IGCSE quiz with 3 questions on this topic: ${text}`;
-  } else if (command === "/check") {
-    prompt = buildGraderPrompt(text);
-  }
-
-  try {
-    const response = await openai.chat.completions.create({
+    // 💬 CASE 2 — no file attached (normal chat)
+    const chatResp = await openai.chat.completions.create({
       model: "gpt-4o",
       messages: [
-        { role: "system", content: "You are Axon AI, a helpful IGCSE tutor." },
-        { role: "user", content: prompt },
+        {
+          role: "system",
+          content:
+            "You are Axon AI, a smart and friendly IGCSE tutor for Physics, Chemistry, Biology, Math, and English.",
+        },
+        { role: "user", content: textPrompt },
       ],
     });
 
-    res.send(response.choices[0].message.content);
+    const reply = chatResp.choices[0].message.content;
+    await slackClient.chat.postMessage({ channel: event.channel, text: reply });
   } catch (err) {
-    console.error(err);
-    res.send("Something went wrong. Please try again.");
+    console.error("Slack event error:", err);
   }
 });
 
