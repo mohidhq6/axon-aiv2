@@ -1,35 +1,35 @@
-// index.js — ES module, production-ready Slack bot
+// index.js — Final, production-ready Slack bot (ES modules)
+
 import express from "express";
 import bodyParser from "body-parser";
 import axios from "axios";
 import fs from "fs";
-import path from "path";
 import dotenv from "dotenv";
 import OpenAI from "openai";
 import pkg from "@slack/bolt";
-import * as pdfjsLib from "pdfjs-dist/build/pdf.mjs";
-import { createWorker } from "tesseract.js";
+import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
+import tesseract from "tesseract.js-node";
 
 dotenv.config();
 const { App, ExpressReceiver } = pkg;
 
-// ---- Basic config & validation ----
+// ---- Basic config ----
 const PORT = Number(process.env.PORT || 10000);
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
 const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 if (!SLACK_BOT_TOKEN || !SLACK_SIGNING_SECRET || !OPENAI_API_KEY) {
-  console.error("ERROR: Set SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET and OPENAI_API_KEY in environment.");
+  console.error("❌ Missing environment variables.");
   process.exit(1);
 }
 
-// ---- Express app for Render + use with ExpressReceiver ----
+// ---- Express setup ----
 const expressApp = express();
 expressApp.use(bodyParser.json());
-expressApp.get("/", (req, res) => res.send("Axon AI — alive"));
+expressApp.get("/", (req, res) => res.send("✅ Axon AI is live"));
 
-// ---- Slack receiver wired to Express ----
+// ---- Slack setup ----
 const receiver = new ExpressReceiver({
   signingSecret: SLACK_SIGNING_SECRET,
   endpoints: "/slack/events",
@@ -41,27 +41,7 @@ const slackApp = new App({
   receiver,
 });
 
-// ---- OpenAI client ----
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
-
-// ---- Tesseract worker (shared) ----
-const ocrWorker = createWorker({
-  logger: /* optional */ m => { /* console.log("OCR:", m); */ },
-});
-let ocrReady = false;
-
-async function initOcr() {
-  try {
-    await ocrWorker.load();
-    await ocrWorker.loadLanguage("eng");
-    await ocrWorker.initialize("eng");
-    ocrReady = true;
-    console.log("✅ OCR worker initialized");
-  } catch (e) {
-    console.error("Failed to init OCR:", e);
-    ocrReady = false;
-  }
-}
 
 // ---- Helpers ----
 
@@ -75,30 +55,28 @@ async function downloadFileBuffer(url) {
 }
 
 async function extractTextFromPDFBuffer(buffer) {
-  // Using pdfjs-dist legacy build (ESM-safe)
   const loadingTask = pdfjsLib.getDocument({ data: buffer });
   const pdf = await loadingTask.promise;
-  let fullText = "";
+  let text = "";
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
     const content = await page.getTextContent();
-    const pageText = content.items.map((it) => it.str).join(" ");
-    fullText += `\n\n--- Page ${i} ---\n${pageText}`;
+    text += content.items.map((it) => it.str).join(" ") + "\n\n";
   }
-  return fullText.trim();
+  return text.trim();
 }
 
 async function extractTextFromImageBuffer(buffer) {
-  if (!ocrReady) {
-    await initOcr();
-    if (!ocrReady) throw new Error("OCR unavailable");
+  try {
+    const { data: { text } } = await tesseract.recognize(buffer, "eng");
+    return text.trim();
+  } catch (err) {
+    console.error("OCR Error:", err);
+    return "";
   }
-  const { data } = await ocrWorker.recognize(buffer);
-  return (data && data.text) ? data.text.trim() : "";
 }
 
 async function askOpenAI(systemPrompt, userContent, model = "gpt-4o-mini") {
-  // Send a chat completion request and return the assistant text
   const resp = await openai.chat.completions.create({
     model,
     messages: [
@@ -109,104 +87,100 @@ async function askOpenAI(systemPrompt, userContent, model = "gpt-4o-mini") {
   return resp?.choices?.[0]?.message?.content ?? "";
 }
 
-// ---- Main behavior: respond to @mentions ----
+// ---- Slack behavior ----
 slackApp.event("app_mention", async ({ event, client, logger }) => {
   try {
-    const mentionText = (event.text || "").replace(/<@[^>]+>/g, "").trim() || "";
+    const text = (event.text || "").replace(/<@[^>]+>/g, "").trim();
 
-    // If files attached (process first file)
-    if (Array.isArray(event.files) && event.files.length > 0) {
+    // Handle file uploads
+    if (event.files && event.files.length > 0) {
       const file = event.files[0];
       await client.chat.postMessage({
         channel: event.channel,
         thread_ts: event.ts,
-        text: "🔍 Received your file. Working on it now — I'll post the solution in this thread.",
+        text: ":hourglass: Processing your file...",
       });
 
       const downloadUrl = file.url_private_download || file.url_private;
       if (!downloadUrl) {
-        await client.chat.postMessage({ channel: event.channel, thread_ts: event.ts, text: "Cannot access the uploaded file." });
+        await client.chat.postMessage({
+          channel: event.channel,
+          thread_ts: event.ts,
+          text: "⚠️ Couldn't access file URL.",
+        });
         return;
       }
 
       const buffer = await downloadFileBuffer(downloadUrl);
-      let extractedText = "";
+      let extracted = "";
 
-      // Determine type and extract
-      const mimetype = (file.mimetype || "").toLowerCase();
-      if (mimetype.includes("pdf") || (file.filetype && file.filetype === "pdf")) {
-        extractedText = await extractTextFromPDFBuffer(buffer);
-        // If extracted text is tiny, try OCR fallback by rendering pages to images (advanced) — skip for now
-      } else if (mimetype.startsWith("image/")) {
-        extractedText = await extractTextFromImageBuffer(buffer);
+      const type = (file.mimetype || "").toLowerCase();
+      if (type.includes("pdf")) {
+        extracted = await extractTextFromPDFBuffer(buffer);
+      } else if (type.startsWith("image/")) {
+        extracted = await extractTextFromImageBuffer(buffer);
       } else {
-        await client.chat.postMessage({ channel: event.channel, thread_ts: event.ts, text: "Unsupported file type. I support PDFs and images." });
+        await client.chat.postMessage({
+          channel: event.channel,
+          thread_ts: event.ts,
+          text: "Unsupported file type — only PDFs and images are supported.",
+        });
         return;
       }
 
-      if (!extractedText || extractedText.trim().length < 10) {
-        await client.chat.postMessage({ channel: event.channel, thread_ts: event.ts, text: "Could not extract readable text from that file. Try a clearer scan or a text-PDF." });
+      if (!extracted || extracted.length < 20) {
+        await client.chat.postMessage({
+          channel: event.channel,
+          thread_ts: event.ts,
+          text: "❌ Couldn't read text. Try a clearer file.",
+        });
         return;
       }
 
-      // Ask OpenAI to solve the worksheet/questions. Keep the system instruction specific.
-      const system = "You are Axon AI, an expert IGCSE tutor. For the provided worksheet text, produce clear, numbered, step-by-step solutions for each question present. If there are diagrams referenced, explain assumptions. Use concise, exam-grade answers.";
-      const solution = await askOpenAI(system, extractedText, "gpt-4o");
+      const system = "You are Axon AI, an expert IGCSE tutor. Read the worksheet text and provide concise, exam-grade, step-by-step solutions to each question.";
+      const solution = await askOpenAI(system, extracted, "gpt-4o");
 
-      // Post the solution in the thread (text directly)
-      // If solution is extremely long, consider truncating or splitting into multiple messages
-      const MAX_LEN = 3000;
-      if (solution.length <= MAX_LEN) {
-        await client.chat.postMessage({ channel: event.channel, thread_ts: event.ts, text: `✅ Solved worksheet:\n\n${solution}` });
-      } else {
-        // split into chunks
-        const parts = [];
-        for (let i = 0; i < solution.length; i += MAX_LEN) parts.push(solution.slice(i, i + MAX_LEN));
-        for (const p of parts) {
-          await client.chat.postMessage({ channel: event.channel, thread_ts: event.ts, text: p });
-        }
+      const chunks = solution.match(/[\s\S]{1,2800}/g);
+      for (const part of chunks) {
+        await client.chat.postMessage({ channel: event.channel, thread_ts: event.ts, text: part });
       }
-
       return;
     }
 
-    // Otherwise: simple chat question — reply in thread concisely
-    if (!mentionText) {
-      await client.chat.postMessage({ channel: event.channel, thread_ts: event.ts, text: "Hi — ask me a question or attach a worksheet and mention me." });
-      return;
-    }
-
-    const sys = "You are Axon AI, a friendly, accurate IGCSE tutor. Answer concisely and include step-by-step working when relevant.";
-    const reply = await askOpenAI(sys, mentionText, "gpt-4o-mini");
-
-    await client.chat.postMessage({ channel: event.channel, thread_ts: event.ts, text: reply });
-
-  } catch (err) {
-    logger.error(err);
-    try {
-      await slackApp.client.chat.postMessage({
+    // Handle plain question
+    if (!text) {
+      await client.chat.postMessage({
         channel: event.channel,
         thread_ts: event.ts,
-        text: "⚠️ Sorry — I couldn't complete that. Try again or upload a clearer image/PDF.",
+        text: "Hi 👋 — ask me a question or upload a worksheet!",
       });
-    } catch (e) {
-      console.error("Failed posting error message:", e);
+      return;
     }
+
+    const system = "You are Axon AI, a friendly IGCSE tutor. Provide accurate, concise answers with steps when relevant.";
+    const answer = await askOpenAI(system, text);
+    await client.chat.postMessage({
+      channel: event.channel,
+      thread_ts: event.ts,
+      text: answer,
+    });
+  } catch (err) {
+    logger.error("Error handling mention:", err);
+    await slackApp.client.chat.postMessage({
+      channel: event.channel,
+      thread_ts: event.ts,
+      text: "⚠️ Sorry, I ran into an error while processing your request.",
+    });
   }
 });
 
-// ---- Start everything ----
+// ---- Start server ----
 (async () => {
-  // initialize OCR worker in background
-  initOcr().catch((e) => console.warn("OCR init failed:", e));
-
   try {
-    // Start Bolt listener (this will attach the ExpressReceiver to expressApp)
     await slackApp.start(PORT);
-    console.log(`✅ Axon AI running (Bolt) on port ${PORT}`);
-    // expressApp already handles "/" and receiver is mounted at /slack/events by ExpressReceiver
+    console.log(`✅ Axon AI running on port ${PORT}`);
   } catch (e) {
-    console.error("Failed to start Axon AI:", e);
+    console.error("Failed to start app:", e);
     process.exit(1);
   }
 })();
