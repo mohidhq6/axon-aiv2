@@ -1,0 +1,17 @@
+{
+  "name": "axon-ai",
+  "version": "1.0.0",
+  "description": "Axon AI Slack tutoring assistant",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "body-parser": "^1.20.2",
+    "dotenv": "^16.4.5",
+    "@slack/web-api": "^7.2.0",
+    "openai": "^4.72.0"
+  }
+}

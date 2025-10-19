@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: axon-ai
+    env: node
+    buildCommand: "npm install"
+    startCommand: "node index.js"
+    plan: free
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: SLACK_BOT_TOKEN
+        sync: false
+      - key: SLACK_SIGNING_SECRET
+        sync: false
+      - key: PORT
+        value: 10000
