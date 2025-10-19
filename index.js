@@ -1,79 +1,117 @@
 import express from "express";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
-import fetch from "node-fetch";
-import fs from "fs";
-import OpenAI from "openai";
-import PDFDocument from "pdfkit";
 import { WebClient } from "@slack/web-api";
+import OpenAI from "openai";
+import fs from "fs";
+import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+import { buildGraderPrompt } from "./graderPrompt.js";
 
 dotenv.config();
 
 const app = express();
 const port = process.env.PORT || 10000;
 
+app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
+
 const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Slack Events (Mentions)
+// Respond to mentions (@Axon AI)
 app.post("/slack/events", async (req, res) => {
   try {
     const { challenge, event } = req.body;
+
+    // Slack URL verification
     if (challenge) return res.status(200).send(challenge);
-    res.status(200).send(); // Respond early so Slack doesn't timeout
 
-    // Only handle app mentions
+    // Always respond immediately so Slack doesn't timeout
+    res.status(200).send();
+
+    // Handle only app mentions (@Axon AI)
     if (event && event.type === "app_mention") {
-      const text = event.text.replace(/<@\w+>/, "").trim();
-      const files = event.files || [];
+      const prompt = event.text.replace(/<@\w+>\s*/, "").trim();
 
-      // 🧾 If PDF is attached
-      if (files.length > 0 && files[0].filetype === "pdf") {
-        const fileUrl = files[0].url_private_download;
-        const headers = { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` };
+      // Get answer from OpenAI
+      const response = await openai.chat.completions.create({
+        model: "gpt-4o",
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are Axon AI, a smart and friendly IGCSE tutor for Physics, Chemistry, Biology, Math, and English.",
+          },
+          { role: "user", content: prompt },
+        ],
+      });
 
-        const pdfBuffer = await fetch(fileUrl, { headers }).then(res => res.arrayBuffer());
-        const base64PDF = Buffer.from(pdfBuffer).toString("base64");
+      const answer = response.choices[0].message.content;
 
-        // Ask OpenAI to solve the PDF content
-        const solveResponse = await openai.chat.completions.create({
-          model: "gpt-4o-mini",
-          messages: [
-            { role: "system", content: "You are an expert IGCSE tutor. Solve questions from PDFs step by step." },
-            { role: "user", content: "Solve all the questions in this PDF and include both the questions and their full answers." },
-            { role: "user", content: [{ type: "input", input: { mime_type: "application/pdf", data: base64PDF } }] }
-          ],
-        });
+      // Create a solved PDF with Q&A
+      const pdfDoc = await PDFDocument.create();
+      const page = pdfDoc.addPage([595, 842]); // A4
+      const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+      const fontSize = 12;
 
-        const solutionText = solveResponse.choices[0].message.content;
+      const text = `Question:\n${prompt}\n\nAnswer:\n${answer}`;
+      page.drawText(text, {
+        x: 50,
+        y: 750,
+        size: fontSize,
+        font,
+        color: rgb(0, 0, 0),
+        lineHeight: 16,
+        maxWidth: 500,
+      });
 
-        // 🧠 Create a new solved PDF
-        const doc = new PDFDocument();
-        const output = "solved.pdf";
-        const stream = fs.createWriteStream(output);
-        doc.pipe(stream);
-        doc.fontSize(16).text("Solved IGCSE Questions", { align: "center" });
-        doc.moveDown();
-        doc.fontSize(12).text(solutionText);
-        doc.end();
+      const pdfBytes = await pdfDoc.save();
+      const filePath = "./axon_solution.pdf";
+      fs.writeFileSync(filePath, pdfBytes);
 
-        stream.on("finish", async () => {
-          await slackClient.files.upload({
-            channels: event.channel,
-            initial_comment: "Here’s your solved PDF 📘",
-            file: fs.createReadStream(output),
-          });
-        });
-      } else {
-        // 🗣 Regular text question
-        const response = await openai.chat.completions.create({
-          model: "gpt-4o",
-          messages: [
-            { role: "system", content: "You are Axon AI, a helpful IGCSE tutor." },
-            { role: "user", content: text },
-          ],
-        });
+      // Upload the PDF to Slack
+      await slackClient.files.upload({
+        channels: event.channel,
+        initial_comment: "Here’s your solved PDF 📘",
+        file: fs.createReadStream(filePath),
+        filename: "axon_solution.pdf",
+      });
 
-        await slackClient.chat.postMessage({
-          channel: event.channel,
+      // Cleanup
+      fs.unlinkSync(filePath);
+    }
+  } catch (error) {
+    console.error("Error handling Slack event:", error);
+  }
+});
+
+// Slash commands: /explain, /quiz, /check
+app.post("/slack/commands", async (req, res) => {
+  const { command, text } = req.body;
+  let prompt = "";
+
+  if (command === "/explain") {
+    prompt = `Explain the following IGCSE concept clearly: ${text}`;
+  } else if (command === "/quiz") {
+    prompt = `Create a short IGCSE quiz with 3 questions on this topic: ${text}`;
+  } else if (command === "/check") {
+    prompt = buildGraderPrompt(text);
+  }
+
+  try {
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o",
+      messages: [
+        { role: "system", content: "You are Axon AI, a helpful IGCSE tutor." },
+        { role: "user", content: prompt },
+      ],
+    });
+
+    res.send(response.choices[0].message.content);
+  } catch (err) {
+    console.error(err);
+    res.send("Something went wrong. Please try again.");
+  }
+});
+
+app.listen(port, () => console.log(`✅ Axon AI running on port ${port}`));
