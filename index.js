@@ -100,8 +100,8 @@ app.post("/slack/events", async (req, res) => {
         // Generate and upload solved PDF
         const solvedFilePath = await generateSolvedPDF(textContent, answer);
 
-        await slackClient.files.upload({
-          channels: event.channel,
+        await slackClient.files.uploadV2({
+          channel_id: event.channel,
           initial_comment: "Here’s your solved worksheet 📘",
           file: fs.createReadStream(solvedFilePath),
           filename: "axon_solution.pdf",
