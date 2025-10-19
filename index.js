@@ -4,8 +4,9 @@ import dotenv from "dotenv";
 import { WebClient } from "@slack/web-api";
 import OpenAI from "openai";
 import fs from "fs";
-import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+import axios from "axios";
 import pdfParse from "pdf-parse";
+import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 
 dotenv.config();
 
@@ -18,121 +19,115 @@ app.use(bodyParser.json());
 const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// helper: create a PDF from text
-async function createPdfFromText(text, filename = "axon_solution.pdf") {
+// Helper: Generate a solved PDF
+async function generateSolvedPDF(question, answer) {
   const pdfDoc = await PDFDocument.create();
-  const page = pdfDoc.addPage([595, 842]);
+  const page = pdfDoc.addPage([595, 842]); // A4 size
   const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
   const fontSize = 12;
 
-  const lines = text.split("\n");
-  let y = 800;
-  for (let line of lines) {
-    page.drawText(line, { x: 50, y, size: fontSize, font, color: rgb(0, 0, 0) });
-    y -= 16;
-    if (y < 50) {
-      page = pdfDoc.addPage([595, 842]);
-      y = 800;
-    }
-  }
+  const text = `Question:\n${question}\n\nAnswer:\n${answer}`;
+  page.drawText(text, {
+    x: 50,
+    y: 750,
+    size: fontSize,
+    font,
+    color: rgb(0, 0, 0),
+    lineHeight: 16,
+    maxWidth: 500,
+  });
 
   const pdfBytes = await pdfDoc.save();
-  const path = `./${filename}`;
-  fs.writeFileSync(path, pdfBytes);
-  return path;
+  const filePath = "./axon_solution.pdf";
+  fs.writeFileSync(filePath, pdfBytes);
+  return filePath;
 }
 
+// --- SLACK EVENTS HANDLER ---
 app.post("/slack/events", async (req, res) => {
   try {
     const { challenge, event } = req.body;
+
+    // Slack verification
     if (challenge) return res.status(200).send(challenge);
 
-    res.status(200).send(); // immediate 200 for Slack
+    // Respond immediately so Slack doesn’t timeout
+    res.status(200).send();
 
-    if (event.type !== "app_mention") return;
+    if (!event || event.type !== "app_mention") return;
 
-    const textPrompt = (event.text || "").replace(/<@[\w]+>/, "").trim();
+    // Remove bot mention from text
+    const prompt = event.text.replace(/<@\w+>\s*/, "").trim();
 
-    // 📘 CASE 1 — user attached a PDF
+    // Check if there are any attached files (like a worksheet)
     if (event.files && event.files.length > 0) {
-      const pdfFile = event.files.find(f => f.mimetype === "application/pdf");
-      if (!pdfFile) {
-        await slackClient.chat.postMessage({
-          channel: event.channel,
-          text: "Please attach a PDF file.",
+      const file = event.files[0];
+
+      if (file.mimetype === "application/pdf") {
+        // Download the PDF
+        const pdfUrl = file.url_private_download;
+        const response = await axios.get(pdfUrl, {
+          responseType: "arraybuffer",
+          headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
         });
+
+        // Extract text from the PDF
+        const pdfData = await pdfParse(response.data);
+        const textContent = pdfData.text.trim();
+
+        // Ask OpenAI to solve the worksheet
+        const aiResponse = await openai.chat.completions.create({
+          model: "gpt-4o",
+          messages: [
+            {
+              role: "system",
+              content:
+                "You are Axon AI, an expert IGCSE tutor. Read the worksheet and provide clear, step-by-step answers.",
+            },
+            { role: "user", content: textContent },
+          ],
+        });
+
+        const answer = aiResponse.choices[0].message.content;
+
+        // Generate and upload solved PDF
+        const solvedFilePath = await generateSolvedPDF(textContent, answer);
+
+        await slackClient.files.upload({
+          channels: event.channel,
+          initial_comment: "Here’s your solved worksheet 📘",
+          file: fs.createReadStream(solvedFilePath),
+          filename: "axon_solution.pdf",
+        });
+
+        fs.unlinkSync(solvedFilePath);
         return;
       }
-
-      // download the PDF
-      const fileInfo = await slackClient.files.info({ file: pdfFile.id });
-      const url = fileInfo.file.url_private_download;
-
-      const response = await fetch(url, {
-        headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
-      });
-      const buffer = Buffer.from(await response.arrayBuffer());
-
-      const data = await pdfParse(buffer);
-      const extractedText = data.text.trim();
-
-      if (!extractedText) {
-        await slackClient.chat.postMessage({
-          channel: event.channel,
-          text: "Couldn't read text from this PDF.",
-        });
-        return;
-      }
-
-      // send to OpenAI for solving
-      const aiResp = await openai.chat.completions.create({
-        model: "gpt-4o",
-        messages: [
-          { role: "system", content: "You are Axon AI, a friendly IGCSE tutor." },
-          { role: "user", content: `Solve the questions in this text:\n${extractedText}` },
-        ],
-      });
-
-      const answer = aiResp.choices[0].message.content;
-
-      // make PDF
-      const solvedPath = await createPdfFromText(answer, "axon_solution.pdf");
-
-      // upload solved PDF
-      await slackClient.files.uploadV2({
-        channel_id: event.channel,
-        initial_comment: "Here’s your solved PDF 📘",
-        filename: "axon_solution.pdf",
-        file: fs.createReadStream(solvedPath),
-      });
-
-      fs.unlinkSync(solvedPath);
-
-      // short text reply too
-      await slackClient.chat.postMessage({
-        channel: event.channel,
-        text: "✅ Solved! See attached PDF.",
-      });
-      return;
     }
 
-    // 💬 CASE 2 — no file attached (normal chat)
-    const chatResp = await openai.chat.completions.create({
-      model: "gpt-4o",
+    // --- Otherwise, handle as a normal text question ---
+    const chatResponse = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
       messages: [
         {
           role: "system",
           content:
-            "You are Axon AI, a smart and friendly IGCSE tutor for Physics, Chemistry, Biology, Math, and English.",
+            "You are Axon AI, a friendly and knowledgeable IGCSE tutor. Reply directly in chat with clear, concise explanations.",
         },
-        { role: "user", content: textPrompt },
+        { role: "user", content: prompt },
       ],
     });
 
-    const reply = chatResp.choices[0].message.content;
-    await slackClient.chat.postMessage({ channel: event.channel, text: reply });
-  } catch (err) {
-    console.error("Slack event error:", err);
+    const answer = chatResponse.choices[0].message.content;
+
+    // Reply in Slack
+    await slackClient.chat.postMessage({
+      channel: event.channel,
+      text: answer,
+      thread_ts: event.ts,
+    });
+  } catch (error) {
+    console.error("Error handling Slack event:", error);
   }
 });
 
