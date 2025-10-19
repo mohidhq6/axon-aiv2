@@ -1,81 +1,153 @@
-import express from "express";
 import pkg from "@slack/bolt";
-import fs from "fs";
-import pdfParse from "pdf-parse";
-import axios from "axios";
-
 const { App } = pkg;
+import OpenAI from "openai";
+import axios from "axios";
+import fs from "fs";
+import { PDFDocument, StandardFonts } from "pdf-lib";
+import Tesseract from "tesseract.js";
+import dotenv from "dotenv";
+dotenv.config();
 
-// Initialize Slack Bolt app
+// Lazy import for pdf-parse to avoid startup crash
+let pdfParse;
+async function getPdfParse() {
+  if (!pdfParse) pdfParse = (await import("pdf-parse")).default;
+  return pdfParse;
+}
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
-  signingSecret: process.env.SLACK_SIGNING_SECRET,
-  socketMode: false,
-  appToken: process.env.SLACK_APP_TOKEN,
+  signingSecret: process.env.SLACK_SIGNING_SECRET
 });
 
-// Express server for Render health check
-const expressApp = express();
-const PORT = process.env.PORT || 10000;
+async function createSolvedPDF(question, answer) {
+  const pdf = await PDFDocument.create();
+  const font = await pdf.embedFont(StandardFonts.Helvetica);
+  const page = pdf.addPage([595, 842]);
+  const { height } = page.getSize();
+  let y = height - 50;
 
-// Health endpoint
-expressApp.get("/", (req, res) => {
-  res.send("✅ Axon AI is alive and running!");
-});
+  const write = (text, size = 12) => {
+    const lines = text.split("\n");
+    for (const line of lines) {
+      page.drawText(line, { x: 50, y, size, font });
+      y -= size + 4;
+      if (y < 50) {
+        y = height - 50;
+        pdf.addPage([595, 842]);
+      }
+    }
+  };
 
-// Handle text messages sent to the bot
-app.message(async ({ message, say }) => {
-  if (!message.text || message.subtype === "bot_message") return;
+  write("QUESTION(S):", 14);
+  write(question);
+  y -= 14;
+  write("SOLUTION(S):", 14);
+  write(answer);
 
-  const userText = message.text.trim().toLowerCase();
+  const data = await pdf.save();
+  const filePath = `/tmp/axon_solution_${Date.now()}.pdf`;
+  fs.writeFileSync(filePath, data);
+  return filePath;
+}
 
-  if (userText.includes("hello") || userText.includes("hi")) {
-    await say(`Hey there <@${message.user}> 👋 How can I help you today?`);
-    return;
-  }
+async function askOpenAI(systemPrompt, userPrompt, model = "gpt-4o") {
+  const res = await openai.chat.completions.create({
+    model,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt }
+    ]
+  });
+  return res.choices[0].message.content.trim();
+}
 
-  await say("Got it! Processing your message...");
-  // Your logic to handle the message (AI or otherwise) goes here.
-});
+app.event("app_mention", async ({ event, client }) => {
+  try {
+    const userText = (event.text || "").replace(/<@[^>]+>/g, "").trim();
+    const files = event.files || [];
 
-// Handle PDF or image uploads
-app.event("message", async ({ event, client }) => {
-  if (!event.files) return;
+    if (files.length > 0) {
+      const file = files[0];
+      const url = file.url_private_download || file.url_private;
+      const res = await axios.get(url, {
+        responseType: "arraybuffer",
+        headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` }
+      });
+      const mime = file.mimetype || "";
 
-  for (const file of event.files) {
-    if (file.mimetype === "application/pdf") {
-      const fileUrl = file.url_private_download;
-      try {
-        const pdfResponse = await axios.get(fileUrl, {
-          headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
-          responseType: "arraybuffer",
-        });
-        const pdfData = await pdfParse(pdfResponse.data);
+      let extracted = "";
+      if (mime.includes("pdf")) {
+        const pdf = await getPdfParse();
+        const data = await pdf(res.data);
+        extracted = data.text.trim();
+      } else if (mime.startsWith("image/")) {
+        const img = Buffer.from(res.data);
+        const ocr = await Tesseract.recognize(img, "eng");
+        extracted = ocr.data.text.trim();
+      }
+
+      if (!extracted) {
         await client.chat.postMessage({
           channel: event.channel,
-          text: `I read your PDF titled *${file.name}* — here's the extracted text:\n\n${pdfData.text.slice(0, 1000)}...`,
+          text: "Couldn't read that file — please try a clearer PDF or image.",
+          thread_ts: event.ts
         });
-      } catch (err) {
-        console.error("PDF error:", err);
+        return;
       }
-    } else if (file.mimetype.startsWith("image/")) {
+
+      const answer = await askOpenAI(
+        "You are Axon AI, a precise IGCSE tutor. Provide full step-by-step solutions.",
+        extracted
+      );
+
+      const pdfPath = await createSolvedPDF(extracted, answer);
+
+      await client.files.uploadV2({
+        channel_id: event.channel,
+        initial_comment: "✅ Solved worksheet:",
+        file_uploads: [
+          {
+            file: fs.createReadStream(pdfPath),
+            filename: "axon_solution.pdf",
+            title: "Axon Solution"
+          }
+        ]
+      });
+
+      fs.unlinkSync(pdfPath);
+    } else if (userText) {
+      const reply = await askOpenAI(
+        "You are Axon AI, a friendly IGCSE tutor. Explain briefly and clearly.",
+        userText,
+        "gpt-4o-mini"
+      );
       await client.chat.postMessage({
         channel: event.channel,
-        text: `I received your image *${file.name}*! (Image analysis feature coming soon 🔍)`,
+        text: reply,
+        thread_ts: event.ts
+      });
+    } else {
+      await client.chat.postMessage({
+        channel: event.channel,
+        text: "Hi! Upload a PDF/image or ask a question.",
+        thread_ts: event.ts
       });
     }
+  } catch (err) {
+    console.error(err);
+    await client.chat.postMessage({
+      channel: event.channel,
+      text: "⚠️ Something went wrong. Try again.",
+      thread_ts: event.ts
+    });
   }
 });
 
-// Start both servers
 (async () => {
-  try {
-    await app.start(PORT);
-    expressApp.listen(PORT, () => {
-      console.log(`✅ Axon AI is running on port ${PORT}`);
-    });
-    console.log("⚡️ Bolt app is running!");
-  } catch (error) {
-    console.error("Failed to start app:", error);
-  }
+  const port = process.env.PORT || 10000;
+  await app.start(port);
+  console.log(`✅ Axon AI is running on port ${port}`);
 })();
