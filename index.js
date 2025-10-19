@@ -138,7 +138,18 @@ slackApp.event("app_mention", async ({ event, client, logger }) => {
         return;
       }
 
-      const system = "You are Axon AI, an expert IGCSE tutor. For each question, give clear, numbered, step-by-step solutions using plain text formatting. Avoid LaTeX or Markdown syntax (no \\frac, \\(, *, **, or backticks). Use simple symbols like: - Multiplication: × - Division: / - Fractions: write "a/b" - Exponents: write "x^2" etc. Keep your tone friendly and easy to read for students aged 10–17. If you’re solving math, show neat step-by-step working with the final answer clearly labeled.";
+const system = `
+You are Axon AI, an expert IGCSE tutor.
+For each question, give clear, numbered, step-by-step solutions using plain text formatting.
+Avoid LaTeX or Markdown syntax (no \\frac, \\(, *, **, or backticks).
+Use simple symbols like:
+- Multiplication: ×
+- Division: /
+- Fractions: write 'a/b'
+- Exponents: write 'x^2'
+Keep your tone friendly and easy to read for students aged 10–17.
+If you’re solving math, show neat step-by-step working with the final answer clearly labeled.
+`;
       const solution = await askOpenAI(system, extracted, "gpt-4o");
 
       const chunks = solution.match(/[\s\S]{1,2800}/g);
