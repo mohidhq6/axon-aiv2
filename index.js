@@ -20,25 +20,41 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 app.post("/slack/events", async (req, res) => {
   try {
     const { challenge, event } = req.body;
-    if (challenge) return res.send(challenge);
+
+    // Handle Slack URL verification
+    if (challenge) return res.status(200).send(challenge);
+
+    // Respond 200 immediately so Slack doesn't time out
+    res.status(200).send();
+
+    // Process only app mentions (@Axon AI)
     if (event && event.type === "app_mention") {
-      const prompt = event.text.replace(/<@\w+>/, "").trim();
+      const prompt = event.text.replace(/<@\w+>\s*/, "").trim();
+
       const response = await openai.chat.completions.create({
         model: "gpt-4o",
         messages: [
-          { role: "system", content: "You are Axon AI, a smart and friendly IGCSE tutor for Physics, Chemistry, Biology, Math, and English." },
-          { role: "user", content: prompt }
+          {
+            role: "system",
+            content:
+              "You are Axon AI, a smart and friendly IGCSE tutor for Physics, Chemistry, Biology, Math, and English.",
+          },
+          { role: "user", content: prompt },
         ],
       });
+
       const answer = response.choices[0].message.content;
-      await slackClient.chat.postMessage({ channel: event.channel, text: answer });
+
+      await slackClient.chat.postMessage({
+        channel: event.channel,
+        text: answer,
+      });
     }
-    res.sendStatus(200);
   } catch (error) {
-    console.error(error);
-    res.sendStatus(500);
+    console.error("Error handling Slack event:", error);
   }
 });
+
 
 // Slash commands: /explain, /quiz, /check
 app.post("/slack/commands", async (req, res) => {
