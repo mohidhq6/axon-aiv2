@@ -1,7 +1,6 @@
 {
-  "name": "axon-slack-bot",
-  "version": "2.0.0",
-  "description": "Axon AI Slack bot — answers IGCSE questions, solves PDFs and images",
+  "name": "axon-ai",
+  "version": "1.0.0",
   "type": "module",
   "main": "index.js",
   "scripts": {
@@ -9,28 +8,12 @@
   },
   "dependencies": {
     "@slack/web-api": "^7.0.0",
-    "axios": "^1.7.4",
+    "axios": "^1.7.2",
     "body-parser": "^1.20.2",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
     "openai": "^4.0.0",
     "pdf-lib": "^1.17.1",
-    "pdfjs-dist": "^4.4.168",
-    "tesseract.js": "^5.1.0"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  },
-  "keywords": [
-    "slack-bot",
-    "openai",
-    "gpt-4o",
-    "education",
-    "IGCSE",
-    "pdf",
-    "image-ocr",
-    "axon-ai"
-  ],
-  "author": "Axon Learning",
-  "license": "MIT"
+    "pdf-parse": "^1.1.1"
+  }
 }
