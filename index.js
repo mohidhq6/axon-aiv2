@@ -1,113 +1,78 @@
-// index.js — CommonJS version (Render-safe)
-
-require("dotenv").config();
 const { App } = require("@slack/bolt");
 const express = require("express");
 const bodyParser = require("body-parser");
 const fetch = require("node-fetch");
-const fs = require("fs");
-const path = require("path");
-const pdf = require("pdf-parse");
-const OpenAI = require("openai");
+const pdfParse = require("pdf-parse");
+require("dotenv").config();
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const PORT = process.env.PORT || 10000;
+const app = express();
+app.use(bodyParser.json());
 
 const slackApp = new App({
   token: process.env.SLACK_BOT_TOKEN,
   signingSecret: process.env.SLACK_SIGNING_SECRET,
+  socketMode: false,
+  appToken: process.env.SLACK_APP_TOKEN
 });
 
-// helper: get text from pdf
-async function extractTextFromPDF(filePath) {
-  const dataBuffer = fs.readFileSync(filePath);
-  const parsed = await pdf(dataBuffer);
-  return parsed.text || "";
-}
-
-// event: app mention
-slackApp.event("app_mention", async ({ event, client }) => {
+// 🧩 Handle messages and file uploads
+slackApp.message(async ({ message, say, client }) => {
   try {
-    const userMessage = event.text.replace(/<@[^>]+>/, "").trim();
-
-    // If file attached
-    if (event.files && event.files.length > 0) {
-      const file = event.files[0];
+    if (message.files && message.files.length > 0) {
+      const file = message.files[0];
       const fileUrl = file.url_private_download;
-      const tempPath = path.join("/tmp", file.name);
+      await say("📄 Processing your worksheet — please wait a moment.");
 
-      await client.chat.postMessage({
-        channel: event.channel,
-        thread_ts: event.ts,
-        text: "📄 Processing your worksheet — please wait a moment.",
-      });
-
-      // Download file
       const response = await fetch(fileUrl, {
-        headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+        headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` }
       });
-      const buffer = await response.arrayBuffer();
-      fs.writeFileSync(tempPath, Buffer.from(buffer));
+      const arrayBuffer = await response.arrayBuffer();
+      const pdfData = await pdfParse(Buffer.from(arrayBuffer));
+      const text = pdfData.text.slice(0, 8000); // Limit text for prompt
 
-      // Extract text
-      const text = await extractTextFromPDF(tempPath);
-      if (!text || text.trim().length < 5) throw new Error("Empty PDF text");
+      const openai = (await import("openai")).default;
+      const openaiClient = new openai({ apiKey: process.env.OPENAI_API_KEY });
 
-      // Solve using GPT
-      const gptRes = await openai.chat.completions.create({
+      const completion = await openaiClient.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [
           {
             role: "system",
             content:
-              "You are a helpful academic assistant. Read the worksheet and give full, clear, step-by-step answers in text only.",
+              "You are a tutor who solves worksheets and explains clearly. Return the solved answers in simple text."
           },
-          { role: "user", content: text },
-        ],
+          { role: "user", content: text }
+        ]
       });
 
-      const answer = gptRes.choices[0].message.content;
+      await say(`✅ Here's the solved worksheet:\n${completion.choices[0].message.content}`);
+    } else if (message.text) {
+      const prompt = message.text;
 
-      await client.chat.postMessage({
-        channel: event.channel,
-        thread_ts: event.ts,
-        text: `✅ Here's the solved worksheet:\n\n${answer}`,
-      });
+      const openai = (await import("openai")).default;
+      const openaiClient = new openai({ apiKey: process.env.OPENAI_API_KEY });
 
-      fs.unlinkSync(tempPath);
-    } else {
-      // Normal question
-      const gptRes = await openai.chat.completions.create({
+      const completion = await openaiClient.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [
-          {
-            role: "system",
-            content:
-              "You are a knowledgeable academic tutor. Answer user questions directly and clearly in text form.",
-          },
-          { role: "user", content: userMessage },
-        ],
+          { role: "system", content: "You are a subject expert tutor answering concisely." },
+          { role: "user", content: prompt }
+        ]
       });
 
-      const reply = gptRes.choices[0].message.content;
-      await client.chat.postMessage({
-        channel: event.channel,
-        thread_ts: event.ts,
-        text: reply,
-      });
+      await say(completion.choices[0].message.content);
     }
-  } catch (err) {
-    console.error("Error:", err);
-    await slackApp.client.chat.postMessage({
-      channel: event.channel,
-      thread_ts: event.ts,
-      text: "⚠️ Sorry, something went wrong while processing your request.",
-    });
+  } catch (error) {
+    console.error("Error processing message:", error);
+    await say("⚠️ Sorry, something went wrong while processing your request.");
   }
 });
 
-// start server
+// 🖥️ Express for Render health check
+app.get("/", (req, res) => res.send("Axon AI is running 🚀"));
+const port = process.env.PORT || 10000;
+
 (async () => {
-  await slackApp.start(PORT);
-  console.log(`🚀 Axon AI is running on port ${PORT}`);
+  await slackApp.start(port);
+  console.log(`✅ Axon AI is running on port ${port}`);
 })();
