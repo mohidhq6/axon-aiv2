@@ -3,7 +3,7 @@ import bodyParser from "body-parser";
 import dotenv from "dotenv";
 import { WebClient } from "@slack/web-api";
 import OpenAI from "openai";
-import { buildGraderPrompt } from "./utils/graderPrompt.js";
+import { buildGraderPrompt } from './graderPrompt.js';
 
 dotenv.config();
 
