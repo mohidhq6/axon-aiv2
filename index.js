@@ -7,7 +7,7 @@ import fs from "fs";
 import axios from "axios";
 import Tesseract from "tesseract.js";
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
-import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.js"; // ✅ replaces pdf-parse
+import * as pdfjsLib from "pdfjs-dist";
 
 dotenv.config();
 
