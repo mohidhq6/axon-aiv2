@@ -7,7 +7,7 @@ import path from "path";
 import dotenv from "dotenv";
 import OpenAI from "openai";
 import pkg from "@slack/bolt";
-import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.js";
+import * as pdfjsLib from "pdfjs-dist/build/pdf.mjs";
 import { createWorker } from "tesseract.js";
 
 dotenv.config();
